@@ -415,10 +415,48 @@ html, body {
   transform: translateX(-50%);
 }
 
+.film-video {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: none;
+  filter: saturate(0.8) contrast(1.1) sepia(0.15) brightness(1.05);
+}
+
+.film-video.active { display: block; }
+
+.film-canvas { display: none; }
+
 .film-preview {
   width: 100%; height: 100%;
   object-fit: cover;
   display: none;
+}
+
+/* Polaroid filter overlays */
+.film-filter-vignette {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at center, transparent 50%, rgba(0,0,0,0.45) 100%);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.film-filter-grain {
+  position: absolute;
+  inset: 0;
+  opacity: 0.08;
+  pointer-events: none;
+  z-index: 1;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  mix-blend-mode: overlay;
+}
+
+.film-filter-leak {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(255,180,80,0.12) 0%, transparent 40%, transparent 60%, rgba(255,100,80,0.08) 100%);
+  pointer-events: none;
+  z-index: 1;
 }
 
 .film-placeholder {
@@ -1295,6 +1333,8 @@ html, body {
             <div class="film-counter" id="film-counter">00</div>
             <div class="film-viewfinder" id="film-viewfinder">
               <div class="film-flash" id="film-flash"></div>
+              <video class="film-video" id="film-video" autoplay playsinline muted></video>
+              <canvas class="film-canvas" id="film-canvas"></canvas>
               <img class="film-preview" id="film-preview">
               <div class="film-placeholder" id="film-placeholder">
                 <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -1304,6 +1344,10 @@ html, body {
                 </svg>
                 <span>Tap to capture</span>
               </div>
+              <!-- Polaroid filter overlays -->
+              <div class="film-filter-vignette"></div>
+              <div class="film-filter-grain"></div>
+              <div class="film-filter-leak"></div>
               <div class="film-crosshair"></div>
             </div>
             <div class="film-strip" id="film-strip"></div>
@@ -1315,7 +1359,7 @@ html, body {
               <div class="film-sprocket"></div><div class="film-sprocket"></div>
             </div>
           </div>
-          <input type="file" accept="image/*" class="film-input" id="film-input">
+          <input type="file" accept="image/*" class="film-input" id="film-input" capture="environment">
         </div>
       </div>
     </div>
@@ -1483,8 +1527,9 @@ document.querySelectorAll('.btab').forEach(btn => {
     btn.classList.add('active');
     document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
 
-    // Show/hide REC bar
+    // Show/hide REC bar + stop camera when leaving sample tab
     recBar.classList.toggle('visible', btn.dataset.tab === 'sampler');
+    if (btn.dataset.tab !== 'sampler') stopCamera();
   });
 });
 
@@ -1504,8 +1549,11 @@ document.querySelectorAll('.mode-btn').forEach((btn, i) => {
     document.getElementById('machine-' + currentMode).style.display = 'block';
 
     if (isRecording) stopRecording();
+    if (currentMode !== 'image') stopCamera();
     if (currentMode === 'text') {
       setTimeout(() => document.querySelector('.tw-text-area').focus(), 100);
+    } else if (currentMode === 'image') {
+      setTimeout(() => startCamera(), 100);
     }
   });
 });
@@ -1589,11 +1637,114 @@ function animateWaveform() {
 
 // ===== FILM CAMERA =====
 let filmCount = 0;
+let cameraStream = null;
 const filmInput = document.getElementById('film-input');
 const filmViewfinder = document.getElementById('film-viewfinder');
+const filmVideo = document.getElementById('film-video');
+const filmCanvas = document.getElementById('film-canvas');
 
-filmViewfinder.addEventListener('click', () => { filmInput.click(); });
+function startCamera() {
+  if (cameraStream) return; // already running
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } }
+  }).then(stream => {
+    cameraStream = stream;
+    filmVideo.srcObject = stream;
+    filmVideo.classList.add('active');
+    document.getElementById('film-placeholder').style.display = 'none';
+    // Hide last preview so live feed shows
+    document.getElementById('film-preview').style.display = 'none';
+  }).catch(() => {
+    // Camera not available, keep file input as fallback
+    document.getElementById('film-placeholder').querySelector('span').textContent = 'Tap to upload';
+  });
+}
 
+function stopCamera() {
+  if (cameraStream) {
+    cameraStream.getTracks().forEach(t => t.stop());
+    cameraStream = null;
+  }
+  filmVideo.classList.remove('active');
+  filmVideo.srcObject = null;
+}
+
+function capturePhoto() {
+  if (!cameraStream) {
+    // Fallback: open file picker
+    filmInput.click();
+    return;
+  }
+
+  const vw = filmVideo.videoWidth;
+  const vh = filmVideo.videoHeight;
+  filmCanvas.width = vw;
+  filmCanvas.height = vh;
+  const ctx = filmCanvas.getContext('2d');
+
+  // Draw video frame
+  ctx.drawImage(filmVideo, 0, 0, vw, vh);
+
+  // Apply Polaroid filter on canvas
+  // 1. Warm color shift + desaturate
+  const imageData = ctx.getImageData(0, 0, vw, vh);
+  const d = imageData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    // Slight sepia / warm shift
+    const r = d[i], g = d[i+1], b = d[i+2];
+    d[i]   = Math.min(255, r * 1.05 + 15);   // warm reds
+    d[i+1] = Math.min(255, g * 0.98 + 8);    // slight green
+    d[i+2] = Math.min(255, b * 0.85 + 5);    // reduce blues
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  // 2. Vignette
+  const gradient = ctx.createRadialGradient(vw/2, vh/2, vw*0.3, vw/2, vh/2, vw*0.75);
+  gradient.addColorStop(0, 'rgba(0,0,0,0)');
+  gradient.addColorStop(1, 'rgba(0,0,0,0.4)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, vw, vh);
+
+  // 3. Light leak
+  const leak = ctx.createLinearGradient(0, 0, vw, vh);
+  leak.addColorStop(0, 'rgba(255,180,80,0.08)');
+  leak.addColorStop(0.4, 'rgba(255,180,80,0)');
+  leak.addColorStop(0.6, 'rgba(255,180,80,0)');
+  leak.addColorStop(1, 'rgba(255,100,80,0.06)');
+  ctx.fillStyle = leak;
+  ctx.fillRect(0, 0, vw, vh);
+
+  const dataUrl = filmCanvas.toDataURL('image/jpeg', 0.9);
+
+  // Flash
+  const flash = document.getElementById('film-flash');
+  flash.classList.remove('active');
+  void flash.offsetWidth;
+  flash.classList.add('active');
+
+  // Show preview briefly then back to live
+  const preview = document.getElementById('film-preview');
+  preview.src = dataUrl;
+  preview.style.display = 'block';
+  setTimeout(() => { preview.style.display = 'none'; }, 1500);
+
+  // Film strip
+  filmCount++;
+  document.getElementById('film-counter').textContent = String(filmCount).padStart(2, '0');
+  const frame = document.createElement('div');
+  frame.className = 'film-frame';
+  const img = document.createElement('img');
+  img.src = dataUrl;
+  frame.appendChild(img);
+  document.getElementById('film-strip').appendChild(frame);
+
+  addSample('image', 'Photo ' + filmCount, dataUrl);
+}
+
+// Tap viewfinder to capture
+filmViewfinder.addEventListener('click', () => { capturePhoto(); });
+
+// File input fallback
 filmInput.addEventListener('change', e => {
   const file = e.target.files[0];
   if (!file) return;
@@ -1610,7 +1761,6 @@ filmInput.addEventListener('change', e => {
     const preview = document.getElementById('film-preview');
     preview.src = dataUrl;
     preview.style.display = 'block';
-    document.getElementById('film-placeholder').style.display = 'none';
 
     filmCount++;
     document.getElementById('film-counter').textContent = String(filmCount).padStart(2, '0');
@@ -1643,7 +1793,7 @@ document.getElementById('sample-btn').addEventListener('click', () => {
     if (isRecording) stopRecording();
     else startRecording();
   } else if (currentMode === 'image') {
-    filmInput.click();
+    capturePhoto();
   }
 });
 
